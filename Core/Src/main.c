@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
  * @file main.c
- * @brief Single finger IMU test, UP_V3 diagnostic output
+ * @brief Single finger IMU test, UP_V5_HOLD
  */
 /* USER CODE END Header */
 
@@ -15,26 +15,24 @@
 #include <stdio.h>
 /* USER CODE END Includes */
 
-/* USER CODE BEGIN PTD */
-/* USER CODE END PTD */
-
 /* USER CODE BEGIN PD */
 #define APP_UART_PERIOD_MS 50u
-/* USER CODE END PD */
 
-/* USER CODE BEGIN PM */
-/* USER CODE END PM */
+#define APP_STAGE_COLLECT  5u
+#define APP_STAGE_ERROR    6u
+#define APP_STAGE_HOLD     7u
+/* USER CODE END PD */
 
 /* USER CODE BEGIN PV */
 
 static FingerTracker finger;
 
-/* 毫度：除以 1000 得到度 */
+/* 单位：毫度，除以1000得到度 */
 volatile int32_t debug_tilt_mdeg = 0;
 volatile int32_t debug_signed_mdeg = 0;
 volatile int32_t debug_flex_mdeg = 0;
 
-/* 0 伸直、1 中间档、2 弯曲档、255 无效 */
+/* 0：伸直；1：中间档；2：弯曲档；255：无可用档位 */
 volatile uint8_t debug_state = 255;
 volatile uint8_t debug_valid = 0;
 
@@ -45,6 +43,7 @@ volatile uint8_t debug_valid = 0;
  * 4：校准失败
  * 5：正常采集
  * 6：更新失败
+ * 7：侧翻时暂时保留上次角度，继续重试
  */
 volatile uint8_t debug_stage = 0;
 
@@ -52,7 +51,7 @@ volatile uint8_t debug_hal_status = HAL_OK;
 volatile uint8_t debug_uart_status = HAL_OK;
 volatile uint32_t debug_sample_count = 0;
 
-/* 改为 1 后，继续运行会重新初始化并校准 */
+/* 在调试器中改为1，可重新初始化并校准 */
 volatile uint8_t debug_command = 0;
 
 extern volatile uint8_t debug_update_reason;
@@ -82,7 +81,7 @@ static void App_StartSensor(void)
     debug_flex_mdeg = 0;
     debug_update_reason = 0;
 
-    /* AD0 接 GND，地址 0x68 */
+    /* AD0接GND，地址为0x68 */
     debug_stage = 1;
 
     result = Finger_Init(&finger, &hi2c1, 0x68);
@@ -93,16 +92,17 @@ static void App_StartSensor(void)
         return;
     }
 
-    /* 当前向上弯曲得到正角度，因此使用 +1 */
     finger.direction = 1.0f;
     finger.threshold1_deg = 25.0f;
     finger.threshold2_deg = 75.0f;
     finger.hysteresis_deg = 5.0f;
 
     /*
-     * 保持当前芯片朝下的安装方式。
-     * 手心朝上，食指伸直，手掌固定且静止。
+     * 保持原来的安装方式。
+     * 手心朝上、食指伸直，并保持静止。
      */
+    HAL_Delay(2000);
+
     debug_stage = 3;
 
     result = Finger_Calibrate(&finger);
@@ -118,37 +118,50 @@ static void App_StartSensor(void)
 
     debug_valid = finger.valid;
     debug_state = finger.state;
-    debug_stage = 5;
+    debug_stage = APP_STAGE_COLLECT;
 }
 
 static void App_UpdateSensor(void)
 {
     HAL_StatusTypeDef result = Finger_Update(&finger);
 
-    if (result == HAL_BUSY) {
+    if (result == HAL_BUSY && finger.calibrated) {
+
+        /*
+         * reason=2：侧翻导致暂时无法可靠计算角度。
+         * 保留旧角度，但明确标记为无效的新测量。
+         */
+        if (debug_update_reason == 2u &&
+            finger.calibrated &&
+            !finger.valid) {
+
+            debug_hal_status = (uint8_t)HAL_BUSY;
+            debug_valid = 0;
+            debug_state = finger.state;
+            debug_stage = APP_STAGE_HOLD;
+
+            /*
+             * 不修改角度。
+             * 不增加成功采样次数。
+             * 主循环仍会继续调用本函数。
+             */
+        }
+
+        /* 普通未到采样时间的HAL_BUSY也直接等待 */
         return;
     }
 
     debug_hal_status = (uint8_t)result;
 
-    if (result != HAL_OK) {
+    if (result != HAL_OK || !finger.valid) {
         debug_valid = 0;
         debug_state = 255;
-        debug_stage = 6;
-
-        /* 保留最后角度，以 valid 判断是否有效 */
+        debug_stage = APP_STAGE_ERROR;
         return;
     }
 
-    float relative = finger.angle_deg - finger.zero_deg;
-
-    while (relative > 180.0f) {
-        relative -= 360.0f;
-    }
-
-    while (relative < -180.0f) {
-        relative += 360.0f;
-    }
+    const float relative =
+        finger.angle_deg - finger.zero_deg;
 
     debug_tilt_mdeg =
         (int32_t)(finger.angle_deg * 1000.0f);
@@ -163,6 +176,9 @@ static void App_UpdateSensor(void)
     debug_valid = finger.valid;
 
     debug_sample_count++;
+
+    /* 读取恢复正常后，自动回到阶段5 */
+    debug_stage = APP_STAGE_COLLECT;
 }
 
 static void App_SendTelemetry(void)
@@ -170,37 +186,30 @@ static void App_SendTelemetry(void)
     static uint32_t last_send_ms = 0;
     uint32_t now_ms = HAL_GetTick();
 
-    if ((uint32_t)(now_ms - last_send_ms)
-        < APP_UART_PERIOD_MS) {
+    if ((uint32_t)(now_ms - last_send_ms) <
+        APP_UART_PERIOD_MS) {
         return;
     }
 
     last_send_ms = now_ms;
 
-    char message[192];
+    /* 毫度转整数度，四舍五入 */
+    long bend_deg =
+        (long)((debug_flex_mdeg + 500) / 1000);
+
+    char message[160];
 
     int length = snprintf(
         message,
         sizeof(message),
-        "FW=UP_V3,n=%lu,dir=%ld,ddir=%ld,"
-        "a=%ld,da=%ld,f=%ld,mf=%ld,df=%ld,"
-        "state=%u,valid=%u,stage=%u,reason=%u\r\n",
-
-        (unsigned long)debug_driver_count,
-        (long)finger.direction,
-        (long)debug_driver_direction,
-
-        (long)debug_signed_mdeg,
-        (long)debug_driver_relative_mdeg,
-
-        (long)debug_flex_mdeg,
-        (long)(finger.flex_deg * 1000.0f),
-        (long)debug_driver_flex_mdeg,
-
+        "FW=UP_V5_HOLD,bend_deg=%ld,"
+        "state=%u,valid=%u,stage=%u,reason=%u,n=%lu\r\n",
+        bend_deg,
         (unsigned)debug_state,
         (unsigned)debug_valid,
         (unsigned)debug_stage,
-        (unsigned)debug_update_reason
+        (unsigned)debug_update_reason,
+        (unsigned long)debug_sample_count
     );
 
     if (length > 0 && length < (int)sizeof(message)) {
@@ -217,18 +226,9 @@ static void App_SendTelemetry(void)
 
 int main(void)
 {
-    /* USER CODE BEGIN 1 */
-    /* USER CODE END 1 */
-
     HAL_Init();
 
-    /* USER CODE BEGIN Init */
-    /* USER CODE END Init */
-
     SystemClock_Config();
-
-    /* USER CODE BEGIN SysInit */
-    /* USER CODE END SysInit */
 
     MX_GPIO_Init();
     MX_I2C1_Init();
@@ -251,7 +251,13 @@ int main(void)
             App_StartSensor();
         }
 
-        if (debug_stage == 5u) {
+        /*
+         * 阶段5正常采集。
+         * 阶段7也继续采集，等待姿态恢复。
+         */
+        if (debug_stage == APP_STAGE_COLLECT ||
+            debug_stage == APP_STAGE_HOLD) {
+
             App_UpdateSensor();
         }
 
@@ -265,7 +271,6 @@ void SystemClock_Config(void)
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    /* 沿用外部 8MHz 晶振，PLL 倍频至 72MHz */
     RCC_OscInitStruct.OscillatorType =
         RCC_OSCILLATORTYPE_HSE;
 
@@ -297,35 +302,25 @@ void SystemClock_Config(void)
     if (HAL_RCC_ClockConfig(
             &RCC_ClkInitStruct,
             FLASH_LATENCY_2) != HAL_OK) {
+
         Error_Handler();
     }
 }
 
-/* USER CODE BEGIN 4 */
-/* USER CODE END 4 */
-
 void Error_Handler(void)
 {
-    /* USER CODE BEGIN Error_Handler_Debug */
-
     __disable_irq();
 
     while (1) {
     }
-
-    /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef USE_FULL_ASSERT
 
 void assert_failed(uint8_t *file, uint32_t line)
 {
-    /* USER CODE BEGIN 6 */
-
     (void)file;
     (void)line;
-
-    /* USER CODE END 6 */
 }
 
 #endif

@@ -434,7 +434,20 @@ static void classify(FingerTracker *f, uint32_t now)
 
 HAL_StatusTypeDef Finger_Update(FingerTracker *f)
 {
-    if (f == NULL || f->bus == NULL || !f->calibrated) {
+    if (debug_update_reason != 0) {
+        f->valid = 0;
+
+        /* 侧翻时保留原角度、档位和校准状态 */
+        if (debug_update_reason == 2) {
+            f->last_ms = HAL_GetTick();
+            f->candidate = f->state;
+            f->candidate_ms = f->last_ms;
+
+            return HAL_BUSY;
+        }
+
+        /* 其他错误仍按原逻辑处理 */
+        f->calibrated = 0;
         return HAL_ERROR;
     }
 
@@ -487,18 +500,18 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
     f->last_ms = now;
     const float dt = elapsed * 0.001f;
 
-    /* X 轴陀螺仪积分 */
-    float predicted = wrap180(
-        f->angle_deg +
-        (s.gx - f->gyro_bias_dps) * dt
-    );
+    /*
+     * 连续角度积分：
+     * 累计角度不再折回 ±180°。
+     */
+    float predicted = f->angle_deg +
+        (s.gx - f->gyro_bias_dps) * dt;
 
     const float norm2 =
         s.ax * s.ax +
         s.ay * s.ay +
         s.az * s.az;
 
-    /* 加速度计修正 */
     if (norm2 >= ACC_MIN_G * ACC_MIN_G &&
         norm2 <= ACC_MAX_G * ACC_MAX_G) {
         const float acc_angle =
@@ -506,18 +519,22 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
 
         const float alpha = 0.5f / (0.5f + dt);
 
-        predicted = wrap180(
-            predicted +
-            (1.0f - alpha) *
-            wrap180(acc_angle - predicted)
-        );
+        /*
+         * 只把修正误差折回 ±180°。
+         * 累计角度本身保持连续。
+         */
+        predicted += (1.0f - alpha) *
+            wrap180(acc_angle - predicted);
     }
 
     f->angle_deg = predicted;
 
-    /* 同一个相对角度用于弯曲计算与诊断记录 */
+    /*
+     * 相对伸直姿态的连续角度。
+     * 允许超过 180°，不再使用 wrap180。
+     */
     const float relative =
-        wrap180(f->angle_deg - f->zero_deg);
+        f->angle_deg - f->zero_deg;
 
     float flex = f->direction * relative;
 
@@ -525,18 +542,24 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
         flex = 0.0f;
     }
 
+    /*
+     * 超过 180°仍按最大弯曲判断。
+     * 例如 relative=200°，flex=180°。
+     */
     if (flex > 180.0f) {
         flex = 180.0f;
     }
 
     f->flex_deg = flex;
 
-    /* 驱动内部实际计算结果 */
     debug_driver_direction = (int32_t)f->direction;
+
     debug_driver_relative_mdeg =
         (int32_t)(relative * 1000.0f);
+
     debug_driver_flex_mdeg =
         (int32_t)(f->flex_deg * 1000.0f);
+
     debug_driver_count++;
 
     classify(f, now);
