@@ -488,12 +488,14 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
     }
 
     /*
-     * 上一次reason只用于显示，
-     * 不能阻止本次重新读取。
+     * 上一次是否丢失了有效样本。
+     * 恢复读取后，还需要重新对齐角度。
      */
+    const uint8_t recovering = (f->valid == 0u);
+
     debug_update_reason = 0;
 
-    /* 检查方向、阈值和迟滞参数 */
+    /* 检查方向和分档参数 */
     if (!isfinite(f->direction) ||
         !isfinite(f->hysteresis_deg) ||
         !isfinite(f->threshold1_deg) ||
@@ -522,78 +524,111 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
         (uint32_t)(now - f->last_ms);
 
     if (elapsed > 50u) {
-
-        /*
-         * 采样间隔过长时：
-         * 不使用当前角速度补积分整段空白时间。
-         */
         return hold_sample(f, now, 1u, HAL_BUSY);
     }
 
-    /* YZ投影太小，本次角度不可靠 */
+    /* YZ投影过小，本次角度不可靠 */
     if (s.ay * s.ay + s.az * s.az <
         0.25f * 0.25f) {
 
         return hold_sample(f, now, 2u, HAL_BUSY);
     }
 
-    /* 接近±1000度/秒量程上限 */
+    /* 接近陀螺仪量程上限 */
     if (fabsf(s.gx) > GYRO_LIMIT_DPS) {
         return hold_sample(f, now, 3u, HAL_BUSY);
     }
-
-    f->last_ms = now;
-
-    const float dt = elapsed * 0.001f;
-
-    /*
-     * 连续角度积分：
-     * 累计角度不折回±180度。
-     */
-    float predicted =
-        f->angle_deg +
-        (s.gx - f->gyro_bias_dps) * dt;
 
     const float norm2 =
         s.ax * s.ax +
         s.ay * s.ay +
         s.az * s.az;
 
+    const uint8_t acc_ok =
+        norm2 >= ACC_MIN_G * ACC_MIN_G &&
+        norm2 <= ACC_MAX_G * ACC_MAX_G;
+
     /*
-     * 加速度模长接近1g时，
-     * 使用加速度角度修正陀螺仪积分。
+     * 恢复时，如果加速度模长不在有效范围内，
+     * 继续保持旧角度，等待可以用于对齐的样本。
+     *
+     * reason=6：恢复时等待有效加速度。
      */
-    if (norm2 >= ACC_MIN_G * ACC_MIN_G &&
-        norm2 <= ACC_MAX_G * ACC_MAX_G) {
-
-        const float acc_angle =
-            atan2f(s.ay, s.az) * DEG_PER_RAD;
-
-        const float alpha =
-            0.5f / (0.5f + dt);
-
-        /*
-         * 只把修正误差折回±180度，
-         * 累计角度本身保持连续。
-         */
-        predicted +=
-            (1.0f - alpha) *
-            wrap180(acc_angle - predicted);
+    if (recovering && !acc_ok) {
+        return hold_sample(f, now, 6u, HAL_BUSY);
     }
 
-    f->angle_deg = predicted;
+    const float dt = elapsed * 0.001f;
 
-    /* 相对伸直姿态的连续角度 */
-    const float relative =
-        f->angle_deg - f->zero_deg;
+    float predicted;
 
-    float flex = f->direction * relative;
+    if (recovering) {
+
+        /*
+         * 丢样恢复后，用当前加速度角重新对齐。
+         *
+         * 保留原来的zero_deg！
+         * 不会把当前弯曲姿态重新设为零点。
+         */
+        predicted =
+            atan2f(s.ay, s.az) * DEG_PER_RAD;
+
+        f->candidate = f->state;
+        f->candidate_ms = now;
+
+    } else {
+
+        /* 正常采样时，继续使用陀螺仪积分 */
+        predicted =
+            f->angle_deg +
+            (s.gx - f->gyro_bias_dps) * dt;
+
+        if (acc_ok) {
+
+            const float acc_angle =
+                atan2f(s.ay, s.az) * DEG_PER_RAD;
+
+            const float alpha =
+                0.5f / (0.5f + dt);
+
+            predicted +=
+                (1.0f - alpha) *
+                wrap180(acc_angle - predicted);
+        }
+    }
+
+    /*
+     * 去掉累计角度中多余的整圈。
+     *
+     * 使用以弯曲90度为中心的角度分支，
+     * 范围约为-90到270度。
+     *
+     * 这样：
+     * 360度可以回到0度；
+     * 200度仍按深弯处理；
+     * 不会刚超过180度就变成伸直。
+     *
+     * 这是手指分档用途的范围约定，
+     * 不用于记录任意整圈旋转。
+     */
+    const float directed =
+        f->direction * (predicted - f->zero_deg);
+
+    const float bend =
+        wrap180(directed - 90.0f) + 90.0f;
+
+    f->angle_deg =
+        f->zero_deg + f->direction * bend;
+
+    f->last_ms = now;
+
+    /* 显示弯曲角度限制在0到180度 */
+    float flex = bend;
 
     if (flex < 0.0f) {
         flex = 0.0f;
     }
 
-    /* 超过180度时按最大弯曲处理 */
     if (flex > 180.0f) {
         flex = 180.0f;
     }
@@ -604,10 +639,12 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
         (int32_t)f->direction;
 
     debug_driver_relative_mdeg =
-        (int32_t)(relative * 1000.0f);
+        (int32_t)(
+            (f->angle_deg - f->zero_deg) * 1000.0f
+        );
 
     debug_driver_flex_mdeg =
-        (int32_t)(f->flex_deg * 1000.0f);
+        (int32_t)(flex * 1000.0f);
 
     debug_driver_count++;
 

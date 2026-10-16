@@ -17,7 +17,7 @@
 
 /* USER CODE BEGIN PD */
 
-#define APP_UART_PERIOD_MS 50u
+#define APP_UART_PERIOD_MS 100u
 
 #define APP_STAGE_COLLECT  5u
 #define APP_STAGE_ERROR    6u
@@ -115,14 +115,13 @@ static void App_StartSensor(void)
      * 握拳 -> 半握拳：降至95度
      * 半握拳 -> 伸直：降至40度
      *
-     * 新档位需要连续保持约50ms。
+
      */
-    finger.threshold1_deg = 45.0f;
-    finger.threshold2_deg = 100.0f;
+    finger.threshold1_deg = 85.0f;
+    finger.threshold2_deg = 160.0f;
     finger.hysteresis_deg = 5.0f;
 
     /*
-     * 保持原来的安装方式。
      * 手心朝上、食指伸直，并保持静止。
      */
     HAL_Delay(2000);
@@ -201,27 +200,31 @@ static void App_UpdateSensor(void)
 static void App_SendTelemetry(void)
 {
     static uint32_t last_send_ms = 0;
+
     uint32_t now_ms = HAL_GetTick();
 
     if ((uint32_t)(now_ms - last_send_ms) <
         APP_UART_PERIOD_MS) {
         return;
-    }
+        }
 
     last_send_ms = now_ms;
 
-    /* 毫度转整数度，四舍五入 */
     long bend_deg =
         (long)((debug_flex_mdeg + 500) / 1000);
 
-    char message[160];
+    long relative_deg =
+        (long)(debug_signed_mdeg / 1000);
+
+    char message[192];
 
     int length = snprintf(
         message,
         sizeof(message),
-        "FW=UP_V6_FAST,bend_deg=%ld,"
+        "bend_deg=%ld,rel_deg=%ld,"
         "state=%u,valid=%u,stage=%u,reason=%u,n=%lu\r\n",
         bend_deg,
+        relative_deg,
         (unsigned)debug_state,
         (unsigned)debug_valid,
         (unsigned)debug_stage,
@@ -230,6 +233,7 @@ static void App_SendTelemetry(void)
     );
 
     if (length > 0 && length < (int)sizeof(message)) {
+
         debug_uart_status = (uint8_t)HAL_UART_Transmit(
             &huart1,
             (uint8_t *)message,
