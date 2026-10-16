@@ -12,7 +12,7 @@ volatile float debug_cal_norm2 = 0.0f;
 volatile uint32_t debug_cal_samples = 0;
 volatile float debug_cal_gyro_span = -1.0f;
 
-/* 实时加速度，单位 g */
+/* 实时加速度，单位g */
 volatile float debug_run_ax = 0.0f;
 volatile float debug_run_ay = 0.0f;
 volatile float debug_run_az = 0.0f;
@@ -20,11 +20,11 @@ volatile float debug_run_az = 0.0f;
 /*
  * 更新错误原因：
  * 0：正常
- * 1：采样间隔超过 50ms
- * 2：YZ 加速度投影过小
- * 3：X 轴角速度接近量程上限
+ * 1：采样间隔超过50ms
+ * 2：YZ加速度投影过小
+ * 3：X轴角速度接近量程上限
  * 4：方向或分档参数错误
- * 5：I2C 读取失败
+ * 5：I2C读取失败
  */
 volatile uint8_t debug_update_reason = 0;
 
@@ -45,7 +45,17 @@ volatile int32_t debug_driver_flex_mdeg = 0;
 #define I2C_TIMEOUT_MS    20u
 #define CAL_SAMPLES       200u
 
-/* 沿用当前模块的调试范围 */
+/*
+ * 陀螺仪量程：±1000度/秒
+ * GYRO_CONFIG寄存器：0x10
+ * 换算系数：32.8 LSB/(度/秒)
+ *
+ * 量程、换算系数和上限判断必须配套。
+ */
+#define GYRO_LSB_PER_DPS   32.8f
+#define GYRO_LIMIT_DPS     976.0f
+
+/* 加速度模长有效范围 */
 #define ACC_MIN_G         0.70f
 #define ACC_MAX_G         1.30f
 
@@ -116,13 +126,13 @@ static HAL_StatusTypeDef read_sample(
         return result;
     }
 
-    /* 加速度计 ±2g */
+    /* 加速度计：±2g */
     s->ax = be16(b)     / 16384.0f;
     s->ay = be16(b + 2) / 16384.0f;
     s->az = be16(b + 4) / 16384.0f;
 
-    /* 陀螺仪 ±250°/s */
-    s->gx = be16(b + 8) / 131.0f;
+    /* 陀螺仪：±1000度/秒 */
+    s->gx = be16(b + 8) / GYRO_LSB_PER_DPS;
 
     debug_run_ax = s->ax;
     debug_run_ay = s->ay;
@@ -168,13 +178,13 @@ HAL_StatusTypeDef Finger_Init(
     f->address = (uint16_t)address7 << 1;
 
     f->direction = 1.0f;
-    f->threshold1_deg = 25.0f;
-    f->threshold2_deg = 75.0f;
+    f->threshold1_deg = 45.0f;
+    f->threshold2_deg = 100.0f;
     f->hysteresis_deg = 5.0f;
 
     HAL_Delay(100);
 
-    /* WHO_AM_I */
+    /* 读取WHO_AM_I */
     result = HAL_I2C_Mem_Read(
         f->bus,
         f->address,
@@ -189,7 +199,7 @@ HAL_StatusTypeDef Finger_Init(
         return result;
     }
 
-    /* 接受 MPU6050 / MPU6500 的设备标识 */
+    /* 接受MPU6050 / MPU6500设备标识 */
     if (id != 0x68 && id != 0x70) {
         return HAL_ERROR;
     }
@@ -208,13 +218,14 @@ HAL_StatusTypeDef Finger_Init(
         {0x6C, 0x00}, /* 启用各测量轴 */
         {0x1A, 0x06}, /* 低通滤波 */
         {0x19, 0x09}, /* 采样分频 */
-        {0x1B, 0x00}, /* 陀螺仪 ±250°/s */
-        {0x1C, 0x00}  /* 加速度计 ±2g */
+        {0x1B, 0x10}, /* 陀螺仪±1000度/秒 */
+        {0x1C, 0x00}  /* 加速度计±2g */
     };
 
     for (unsigned i = 0;
          i < sizeof settings / sizeof settings[0];
          ++i) {
+
         result = write_reg(
             f,
             settings[i][0],
@@ -226,7 +237,7 @@ HAL_StatusTypeDef Finger_Init(
         }
     }
 
-    /* MPU6500 加速度计滤波配置 */
+    /* MPU6500加速度计滤波配置 */
     if (id == 0x70) {
         result = write_reg(f, 0x1D, 0x06);
 
@@ -303,6 +314,7 @@ HAL_StatusTypeDef Finger_Calibrate(FingerTracker *f)
 
     /* 食指伸直、手掌固定，整个校准过程保持静止 */
     for (unsigned i = 0; i < CAL_SAMPLES; ++i) {
+
         HAL_StatusTypeDef result = read_sample(f, &s);
 
         if (result != HAL_OK) {
@@ -328,10 +340,11 @@ HAL_StatusTypeDef Finger_Calibrate(FingerTracker *f)
         if (norm2 < ACC_MIN_G * ACC_MIN_G ||
             norm2 > ACC_MAX_G * ACC_MAX_G ||
             s.ay * s.ay + s.az * s.az < 0.30f * 0.30f ||
-            fabsf(s.gx) > 244.0f ||
+            fabsf(s.gx) > GYRO_LIMIT_DPS ||
             fabsf(s.ax - first.ax) > 0.10f ||
             fabsf(s.ay - first.ay) > 0.10f ||
             fabsf(s.az - first.az) > 0.10f) {
+
             return HAL_ERROR;
         }
 
@@ -359,7 +372,7 @@ HAL_StatusTypeDef Finger_Calibrate(FingerTracker *f)
     /* 静止陀螺仪零偏 */
     f->gyro_bias_dps = sum_gx / (float)CAL_SAMPLES;
 
-    /* 绕 X 轴的角度，支持零点接近 ±180° */
+    /* 绕X轴角度，支持零点接近±180度 */
     f->zero_deg = atan2f(sum_ay, sum_az) * DEG_PER_RAD;
     f->angle_deg = f->zero_deg;
 
@@ -391,6 +404,7 @@ static void classify(FingerTracker *f, uint32_t now)
     uint8_t next = f->state;
 
     switch (f->state) {
+
         case 0:
             if (a >= t2 + h) {
                 next = 2;
@@ -425,29 +439,45 @@ static void classify(FingerTracker *f, uint32_t now)
         f->candidate_ms = now;
     }
 
-    /* 新档位连续保持至少 50ms */
+    /* 新档位连续保持至少50ms */
     if (next != f->state &&
         (uint32_t)(now - f->candidate_ms) >= CONFIRM_MS) {
+
         f->state = next;
     }
 }
 
+/*
+ * 本次无法可靠更新：
+ * 保留校准、旧角度和内部档位，
+ * 下一周期继续读取。
+ */
+static HAL_StatusTypeDef hold_sample(
+    FingerTracker *f,
+    uint32_t now,
+    uint8_t reason,
+    HAL_StatusTypeDef status)
+{
+    debug_update_reason = reason;
+
+    f->valid = 0;
+    f->last_ms = now;
+
+    /* 无效样本中断档位确认计时 */
+    f->candidate = f->state;
+    f->candidate_ms = now;
+
+    return status;
+}
+
 HAL_StatusTypeDef Finger_Update(FingerTracker *f)
 {
-    if (debug_update_reason != 0) {
+    if (f == NULL || f->bus == NULL) {
+        return HAL_ERROR;
+    }
+
+    if (!f->calibrated) {
         f->valid = 0;
-
-        /* 侧翻时保留原角度、档位和校准状态 */
-        if (debug_update_reason == 2) {
-            f->last_ms = HAL_GetTick();
-            f->candidate = f->state;
-            f->candidate_ms = f->last_ms;
-
-            return HAL_BUSY;
-        }
-
-        /* 其他错误仍按原逻辑处理 */
-        f->calibrated = 0;
         return HAL_ERROR;
     }
 
@@ -457,54 +487,71 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
         return HAL_BUSY;
     }
 
-    Sample s;
-    HAL_StatusTypeDef result = read_sample(f, &s);
-
-    if (result != HAL_OK) {
-        debug_update_reason = 5;
-        f->valid = 0;
-        f->calibrated = 0;
-        return result;
-    }
-
-    now = HAL_GetTick();
-
-    const uint32_t elapsed =
-        (uint32_t)(now - f->last_ms);
-
+    /*
+     * 上一次reason只用于显示，
+     * 不能阻止本次重新读取。
+     */
     debug_update_reason = 0;
 
-    if (elapsed > 50u) {
-        debug_update_reason = 1;
-    } else if (
-        s.ay * s.ay + s.az * s.az < 0.25f * 0.25f) {
-        debug_update_reason = 2;
-    } else if (fabsf(s.gx) > 244.0f) {
-        debug_update_reason = 3;
-    } else if (
+    /* 检查方向、阈值和迟滞参数 */
+    if (!isfinite(f->direction) ||
+        !isfinite(f->hysteresis_deg) ||
+        !isfinite(f->threshold1_deg) ||
+        !isfinite(f->threshold2_deg) ||
         (f->direction != 1.0f && f->direction != -1.0f) ||
         f->hysteresis_deg < 0.0f ||
         f->threshold1_deg <= f->hysteresis_deg ||
         f->threshold2_deg - f->threshold1_deg
             <= 2.0f * f->hysteresis_deg ||
         f->threshold2_deg + f->hysteresis_deg >= 180.0f) {
-        debug_update_reason = 4;
+
+        return hold_sample(f, now, 4u, HAL_ERROR);
     }
 
-    if (debug_update_reason != 0) {
-        f->valid = 0;
-        f->calibrated = 0;
-        return HAL_ERROR;
+    Sample s;
+
+    HAL_StatusTypeDef result = read_sample(f, &s);
+
+    now = HAL_GetTick();
+
+    if (result != HAL_OK) {
+        return hold_sample(f, now, 5u, result);
+    }
+
+    const uint32_t elapsed =
+        (uint32_t)(now - f->last_ms);
+
+    if (elapsed > 50u) {
+
+        /*
+         * 采样间隔过长时：
+         * 不使用当前角速度补积分整段空白时间。
+         */
+        return hold_sample(f, now, 1u, HAL_BUSY);
+    }
+
+    /* YZ投影太小，本次角度不可靠 */
+    if (s.ay * s.ay + s.az * s.az <
+        0.25f * 0.25f) {
+
+        return hold_sample(f, now, 2u, HAL_BUSY);
+    }
+
+    /* 接近±1000度/秒量程上限 */
+    if (fabsf(s.gx) > GYRO_LIMIT_DPS) {
+        return hold_sample(f, now, 3u, HAL_BUSY);
     }
 
     f->last_ms = now;
+
     const float dt = elapsed * 0.001f;
 
     /*
      * 连续角度积分：
-     * 累计角度不再折回 ±180°。
+     * 累计角度不折回±180度。
      */
-    float predicted = f->angle_deg +
+    float predicted =
+        f->angle_deg +
         (s.gx - f->gyro_bias_dps) * dt;
 
     const float norm2 =
@@ -512,27 +559,31 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
         s.ay * s.ay +
         s.az * s.az;
 
+    /*
+     * 加速度模长接近1g时，
+     * 使用加速度角度修正陀螺仪积分。
+     */
     if (norm2 >= ACC_MIN_G * ACC_MIN_G &&
         norm2 <= ACC_MAX_G * ACC_MAX_G) {
+
         const float acc_angle =
             atan2f(s.ay, s.az) * DEG_PER_RAD;
 
-        const float alpha = 0.5f / (0.5f + dt);
+        const float alpha =
+            0.5f / (0.5f + dt);
 
         /*
-         * 只把修正误差折回 ±180°。
+         * 只把修正误差折回±180度，
          * 累计角度本身保持连续。
          */
-        predicted += (1.0f - alpha) *
+        predicted +=
+            (1.0f - alpha) *
             wrap180(acc_angle - predicted);
     }
 
     f->angle_deg = predicted;
 
-    /*
-     * 相对伸直姿态的连续角度。
-     * 允许超过 180°，不再使用 wrap180。
-     */
+    /* 相对伸直姿态的连续角度 */
     const float relative =
         f->angle_deg - f->zero_deg;
 
@@ -542,17 +593,15 @@ HAL_StatusTypeDef Finger_Update(FingerTracker *f)
         flex = 0.0f;
     }
 
-    /*
-     * 超过 180°仍按最大弯曲判断。
-     * 例如 relative=200°，flex=180°。
-     */
+    /* 超过180度时按最大弯曲处理 */
     if (flex > 180.0f) {
         flex = 180.0f;
     }
 
     f->flex_deg = flex;
 
-    debug_driver_direction = (int32_t)f->direction;
+    debug_driver_direction =
+        (int32_t)f->direction;
 
     debug_driver_relative_mdeg =
         (int32_t)(relative * 1000.0f);

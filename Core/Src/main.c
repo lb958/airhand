@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
  * @file main.c
- * @brief Single finger IMU test, UP_V5_HOLD
+ * @brief Single finger IMU test, UP_V6_FAST
  */
 /* USER CODE END Header */
 
@@ -16,11 +16,13 @@
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN PD */
+
 #define APP_UART_PERIOD_MS 50u
 
 #define APP_STAGE_COLLECT  5u
 #define APP_STAGE_ERROR    6u
 #define APP_STAGE_HOLD     7u
+
 /* USER CODE END PD */
 
 /* USER CODE BEGIN PV */
@@ -32,18 +34,25 @@ volatile int32_t debug_tilt_mdeg = 0;
 volatile int32_t debug_signed_mdeg = 0;
 volatile int32_t debug_flex_mdeg = 0;
 
-/* 0：伸直；1：中间档；2：弯曲档；255：无可用档位 */
+/*
+ * state：
+ * 0：伸直
+ * 1：半握拳
+ * 2：握拳
+ * 255：无可用档位
+ */
 volatile uint8_t debug_state = 255;
 volatile uint8_t debug_valid = 0;
 
 /*
+ * stage：
  * 1：初始化
  * 2：初始化失败
  * 3：校准
  * 4：校准失败
  * 5：正常采集
- * 6：更新失败
- * 7：侧翻时暂时保留上次角度，继续重试
+ * 6：更新错误，继续重试
+ * 7：暂时保留旧角度，继续重试
  */
 volatile uint8_t debug_stage = 0;
 
@@ -51,7 +60,7 @@ volatile uint8_t debug_hal_status = HAL_OK;
 volatile uint8_t debug_uart_status = HAL_OK;
 volatile uint32_t debug_sample_count = 0;
 
-/* 在调试器中改为1，可重新初始化并校准 */
+/* 在调试器中改为1，可以重新初始化并校准 */
 volatile uint8_t debug_command = 0;
 
 extern volatile uint8_t debug_update_reason;
@@ -61,9 +70,11 @@ extern volatile uint8_t debug_update_reason;
 void SystemClock_Config(void);
 
 /* USER CODE BEGIN PFP */
+
 static void App_StartSensor(void);
 static void App_UpdateSensor(void);
 static void App_SendTelemetry(void);
+
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
@@ -93,8 +104,21 @@ static void App_StartSensor(void)
     }
 
     finger.direction = 1.0f;
-    finger.threshold1_deg = 25.0f;
-    finger.threshold2_deg = 75.0f;
+
+    /*
+     * 分档参数：以后主要修改这里。
+     *
+     * 当前设置：
+     * 伸直 -> 半握拳：达到50度
+     * 半握拳 -> 握拳：达到105度
+     *
+     * 握拳 -> 半握拳：降至95度
+     * 半握拳 -> 伸直：降至40度
+     *
+     * 新档位需要连续保持约50ms。
+     */
+    finger.threshold1_deg = 45.0f;
+    finger.threshold2_deg = 100.0f;
     finger.hysteresis_deg = 5.0f;
 
     /*
@@ -128,26 +152,19 @@ static void App_UpdateSensor(void)
     if (result == HAL_BUSY && finger.calibrated) {
 
         /*
-         * reason=2：侧翻导致暂时无法可靠计算角度。
-         * 保留旧角度，但明确标记为无效的新测量。
+         * 未到采样时间：
+         * 保持当前显示。
+         *
+         * 本次样本不可靠：
+         * 保留上次角度，显示阶段7，继续重试。
          */
-        if (debug_update_reason == 2u &&
-            finger.calibrated &&
-            !finger.valid) {
-
+        if (!finger.valid) {
             debug_hal_status = (uint8_t)HAL_BUSY;
             debug_valid = 0;
             debug_state = finger.state;
             debug_stage = APP_STAGE_HOLD;
-
-            /*
-             * 不修改角度。
-             * 不增加成功采样次数。
-             * 主循环仍会继续调用本函数。
-             */
         }
 
-        /* 普通未到采样时间的HAL_BUSY也直接等待 */
         return;
     }
 
@@ -177,7 +194,7 @@ static void App_UpdateSensor(void)
 
     debug_sample_count++;
 
-    /* 读取恢复正常后，自动回到阶段5 */
+    /* 读取成功后，自动恢复到阶段5 */
     debug_stage = APP_STAGE_COLLECT;
 }
 
@@ -202,7 +219,7 @@ static void App_SendTelemetry(void)
     int length = snprintf(
         message,
         sizeof(message),
-        "FW=UP_V5_HOLD,bend_deg=%ld,"
+        "FW=UP_V6_FAST,bend_deg=%ld,"
         "state=%u,valid=%u,stage=%u,reason=%u,n=%lu\r\n",
         bend_deg,
         (unsigned)debug_state,
@@ -252,10 +269,12 @@ int main(void)
         }
 
         /*
-         * 阶段5正常采集。
-         * 阶段7也继续采集，等待姿态恢复。
+         * 阶段5：正常采集
+         * 阶段6：错误后继续重试
+         * 阶段7：暂时保持旧角度，继续重试
          */
         if (debug_stage == APP_STAGE_COLLECT ||
+            debug_stage == APP_STAGE_ERROR ||
             debug_stage == APP_STAGE_HOLD) {
 
             App_UpdateSensor();
